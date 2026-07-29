@@ -5,6 +5,11 @@ stability actually measured.
 
 Two halves, in one crate because each is worth more with the other.
 
+| soft clouds | cracked rock | marbled vein | cellular |
+|---|---|---|---|
+| ![](docs/img/soft_clouds.png) | ![](docs/img/cracked_rock.png) | ![](docs/img/marbled_vein.png) | ![](docs/img/cellular.png) |
+
+
 ## Synthesis
 
 A `Material` is a small record of knobs. Sampling it is a pure function
@@ -19,6 +24,17 @@ because `f32`'s ulp at that magnitude exceeds the pixel step and
 adjacent pixels collapse into one lattice cell. The tile still rendered,
 and still rendered fast, which is what made it easy to miss. A test pins
 detail retention out to tile 2⁴⁰.
+
+Four tiles in a 2×2 block, rendered independently. Adjacent tiles
+evaluate the same continuous field at the same coordinates, so there is
+no seam to hide:
+
+![](docs/img/tiling_2x2.png)
+
+The same material at tile 2⁰, 2¹⁰, 2²⁰, 2³⁰ and 2⁴⁰. Different content,
+identical detail, identical cost:
+
+![](docs/img/far_tiles.png)
 
 ```rust
 use tilekiln::{Material, TileId};
@@ -56,6 +72,20 @@ so an analysis is a pure function of `(material, knob, settings)` and
 reproduces bit for bit across machines, thread counts and CPU vector
 widths. An analysis whose answer depended on the core count would not be
 evidence of anything.
+
+Numbers are easy to nod along to and hard to feel, so here is the same
+material with the knob the analysis ranks *least* sensitive stepped
+±2 units:
+
+![](docs/img/perturbed_stable.png)
+
+and the knob it ranks *most* sensitive, stepped by the same ±2 units:
+
+![](docs/img/perturbed_dangerous.png)
+
+Both strips move the same distance along a slider. One is a material;
+the other is five materials. The analysis called that before rendering
+anything.
 
 ## What it finds
 
@@ -131,8 +161,14 @@ analysis omits the bound rather than inventing a constant.
 
 Early, and honest about it.
 
-Working and tested: synthesis, tile addressing, the four features, and
-the stability analysis. 28 tests, clippy clean.
+Working and tested: synthesis, tile addressing, the four features, the
+stability analysis, and a dependency-free PNG writer. 33 tests, clippy
+clean.
+
+The PNG writer uses stored DEFLATE, so files cost roughly their raw byte
+count. That is the price of not taking an image-codec dependency in a
+crate whose argument is that it has no hidden state, and it is paid in
+the repository rather than at run time.
 
 Not yet written: the GPU path. The synthesis code is constrained
 throughout to the operations WGSL specifies exactly, which is what makes

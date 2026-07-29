@@ -59,6 +59,7 @@ pub mod features;
 pub mod hash;
 pub mod material;
 pub mod noise;
+pub mod png;
 
 #[cfg(feature = "analysis")]
 pub mod analysis;

@@ -194,18 +194,40 @@ pub fn fbm(basis: Basis, x: f64, y: f64, octaves: u32, seed: u32) -> f32 {
     sum / norm
 }
 
-/// Ridged variant: `1 − |n|`, sharpened by an integer exponent.
+/// Ridged multifractal: `1 − |n|`, sharpened, applied **per octave**.
 ///
-/// The exponent is an integer and applied by repeated multiplication
-/// rather than `powf`, because `pow` is not exactly specified in WGSL.
+/// The ridging has to happen inside the octave loop. Applying it to the
+/// finished fractal sum instead produces mush: the sum is already
+/// smooth and centred near zero, so `1 − |sum|` is a broad blob rather
+/// than a crease. Ridging each octave before accumulating is what puts
+/// a sharp crest at every zero crossing at every scale, which is what
+/// makes the result read as rock rather than as cloud.
+///
+/// Returns a value in `[0, 1]`, unlike [`fbm`], which is signed. The
+/// caller must not remap it a second time.
 pub fn ridged(basis: Basis, x: f64, y: f64, octaves: u32, sharpness: u32, seed: u32) -> f32 {
-    let n = fbm(basis, x, y, octaves, seed);
-    let r = 1.0 - n.abs();
-    let mut out = r;
-    for _ in 1..sharpness.max(1) {
-        out *= r;
+    let mut sum = 0.0f32;
+    let mut amp = 1.0f32;
+    let mut norm = 0.0f32;
+    let mut fx = x;
+    let mut fy = y;
+
+    for o in 0..octaves.max(1) {
+        let n = basis.sample(fx, fy, seed.wrapping_add(o.wrapping_mul(0x9e37_79b1)));
+        let r = 1.0 - n.abs();
+        // Integer exponent by repeated multiplication: `powf` is not
+        // exactly specified in WGSL, and the mirror has to match.
+        let mut sharp = r;
+        for _ in 1..sharpness.max(1) {
+            sharp *= r;
+        }
+        sum += amp * sharp;
+        norm += amp;
+        amp *= 0.5;
+        fx *= 2.0;
+        fy *= 2.0;
     }
-    out
+    sum / norm
 }
 
 /// Domain warp: displace the sample point by another noise field.

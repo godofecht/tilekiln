@@ -94,8 +94,14 @@ impl Material {
             Pattern::Warped => warped(self.basis, fx, fy, self.octaves, self.warp, self.seed),
         };
 
-        // Map to [0, 1], then apply contrast about the pivot.
-        let unit = raw * 0.5 + 0.5;
+        // Only the signed patterns need remapping. `ridged` already
+        // returns [0, 1], and passing it through `raw * 0.5 + 0.5`
+        // again compressed it into [0.5, 1.0], which is why ridged
+        // materials came out washed-out and pale.
+        let unit = match self.pattern {
+            Pattern::Ridged => raw,
+            Pattern::Fractal | Pattern::Warped => raw * 0.5 + 0.5,
+        };
         let out = (unit - self.pivot) * self.contrast + self.pivot;
         out.clamp(0.0, 1.0)
     }
@@ -175,6 +181,17 @@ impl Tile {
     /// Sample at `(x, y)`. Panics if out of bounds.
     pub fn get(&self, x: u32, y: u32) -> f32 {
         self.data[(y * self.size + x) as usize]
+    }
+
+    /// Encode as an 8-bit greyscale PNG.
+    pub fn to_png(&self) -> Vec<u8> {
+        let px: Vec<u8> = self
+            .data
+            .iter()
+            .copied()
+            .map(crate::png::quantise)
+            .collect();
+        crate::png::grey(self.size, self.size, &px)
     }
 }
 
