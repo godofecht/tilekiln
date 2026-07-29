@@ -1,0 +1,34 @@
+[package]
+name = "tilekiln"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Tile-addressable procedural texture synthesis with measured parameter stability."
+repository = "https://github.com/godofecht/tilekiln"
+readme = "README.md"
+keywords = ["procedural", "texture", "noise", "gpu", "reproducibility"]
+categories = ["graphics", "rendering", "game-development"]
+
+[features]
+default = ["analysis"]
+# Parameter-stability analysis, via the perturbation-kernel engine.
+analysis = ["dep:perturbation-kernel", "dep:rand"]
+# wgpu compute synthesis. Bit-identical to the CPU path.
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+
+[dependencies]
+perturbation-kernel = { version = "2.1", optional = true }
+# The engine hands perturbations a `&mut Rng`; drawing from it needs the
+# `Rng` trait in scope, and the concrete type must match the engine's.
+rand = { version = "0.8", optional = true }
+wgpu = { version = "30", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+pollster = { version = "0.4", optional = true }
+
+[dev-dependencies]
+perturbation-kernel = "2.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
