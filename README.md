@@ -82,12 +82,31 @@ Same shader, nine basis and pattern combinations, one 64×64 tile:
 llvmpipe matches the host almost everywhere, so the arithmetic is
 expressed exactly. Metal fuses, so it does not. WGSL permits both.
 
-The portable promise is therefore a bound. Across 311,040 samples the
-worst disagreement was 8.9e-6, against an 8-bit output level of 3.9e-3,
-about 440 times larger. The picture is the same picture. Guaranteeing
-exactness on every driver would mean dropping floats for fixed point,
-which is how the analysis engine underneath manages a bit-exact device
-path, and that is not built here.
+The portable promise from that path is therefore a bound. Across 311,040
+samples the worst disagreement was 8.9e-6, against an 8-bit output level
+of 3.9e-3, about 440 times larger. The picture is the same picture.
+
+### The fixed-point path
+
+`render_tile_exact` drops floats entirely. Every value is a Q4.27
+integer, so a multiply is a 64-bit product built from four 16-bit partial
+products and Worley distance is a 31-iteration integer square root, both
+spelled out in `synth_exact.wgsl` because WGSL has no integer wider than
+32 bits. Integer arithmetic has one answer, so there is nothing for a
+compiler to contract or reassociate.
+
+Same nine combinations, same M4 Max, same test run:
+
+| path | bit-identical to host |
+|---|---|
+| floating point | 0 of 9 |
+| fixed point | 9 of 9 |
+
+It costs between 1.6x and 4.2x the floating-point path on one core,
+worst on ridged materials where the sharpening loop runs the emulated
+multiply repeatedly. The two paths produce the same picture and not the
+same bits, since 27 fractional bits are not 24 significant ones, so they
+are alternatives rather than a fast and a slow version of one thing.
 
 ## Stability
 
@@ -208,11 +227,12 @@ count. That is the price of not taking an image-codec dependency in a
 crate whose argument is that it has no hidden state, and it is paid in
 the repository rather than at run time.
 
-The GPU path is written and measured, under the `gpu` feature. It is
-bit-identical on drivers that do not fuse and within 8.9e-6 on ones that
-do, for the reason given above. `tests/gpu.rs` pins the bound, reports
-which combinations came out exact, and skips cleanly with no adapter; CI
-runs it on llvmpipe so both rows of that table stay honest.
+Both GPU paths are written and measured, under the `gpu` feature. The
+floating-point one is bit-identical on drivers that do not fuse and
+within 8.9e-6 on ones that do; the fixed-point one is bit-identical
+everywhere it has been run. `tests/gpu.rs` asserts `to_bits()` equality
+for the second with no tolerance at all, and skips cleanly with no
+adapter. CI runs the whole file on llvmpipe.
 
 ## License
 

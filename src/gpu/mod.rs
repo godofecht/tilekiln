@@ -68,6 +68,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::exact::{Lat, Prepared};
 use crate::material::{Material, Pattern, Tile, TileId};
 use crate::noise::{Basis, Lattice};
 
@@ -92,6 +93,32 @@ struct Params {
     pad1: f32,
 }
 
+/// Parameters for the fixed-point pipeline.
+///
+/// Every field is an integer, including the ones that were floats in
+/// [`Params`]: the whole point of that path is that no float crosses to
+/// the device except the output.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ParamsExact {
+    origin_cell_x: i32,
+    origin_cell_y: i32,
+    origin_frac_x: i32,
+    origin_frac_y: i32,
+    size: u32,
+    seed: u32,
+    octaves: u32,
+    sharpness: u32,
+    basis: u32,
+    pattern: u32,
+    step: i32,
+    warp: i32,
+    contrast: i32,
+    pivot: i32,
+    recip: i32,
+    recip2: i32,
+}
+
 /// Why a device could not be used.
 #[derive(Debug, Clone)]
 pub struct Unavailable(pub String);
@@ -112,6 +139,7 @@ pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    pipeline_exact: wgpu::ComputePipeline,
     /// Human-readable device description.
     pub name: String,
 }
@@ -142,23 +170,28 @@ impl Gpu {
         // asynchronously and lost.
         device.on_uncaptured_error(std::sync::Arc::new(|e| panic!("wgpu validation: {e}")));
 
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("synth"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/synth.wgsl").into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("synth"),
-            layout: None,
-            module: &module,
-            entry_point: Some("render"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let compile = |label: &str, src: &str| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &module,
+                entry_point: Some("render"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let pipeline = compile("synth", include_str!("shaders/synth.wgsl"));
+        let pipeline_exact = compile("synth_exact", include_str!("shaders/synth_exact.wgsl"));
 
         Ok(Self {
             device,
             queue,
             pipeline,
+            pipeline_exact,
             name,
         })
     }
@@ -203,12 +236,63 @@ impl Gpu {
             pad1: 0.0,
         };
 
+        self.dispatch(&self.pipeline, bytemuck::bytes_of(&params), size)
+    }
+
+    /// Render one tile with the fixed-point pipeline.
+    ///
+    /// Returns exactly what [`Material::render_tile_exact`] returns, on
+    /// every driver. Nothing in that path is a float, so there is no
+    /// rounding for a shader compiler to decide differently about.
+    pub fn render_tile_exact(&self, m: &Material, tile: TileId, size: u32) -> Tile {
+        let p = Prepared::new(m);
+        let freq = m.frequency as f64;
+        let ox = Lat::split(tile.x as f64 * freq);
+        let oy = Lat::split(tile.y as f64 * freq);
+
+        let params = ParamsExact {
+            origin_cell_x: ox.cell,
+            origin_cell_y: oy.cell,
+            origin_frac_x: ox.frac,
+            origin_frac_y: oy.frac,
+            size,
+            seed: p.seed,
+            octaves: p.octaves,
+            sharpness: p.sharpness,
+            basis: match p.basis {
+                Basis::Value => 0,
+                Basis::Gradient => 1,
+                Basis::Worley => 2,
+            },
+            pattern: match p.pattern {
+                Pattern::Fractal => 0,
+                Pattern::Ridged => 1,
+                Pattern::Warped => 2,
+            },
+            step: crate::fixed::from_f32(m.frequency / size as f32),
+            warp: p.warp,
+            contrast: p.contrast,
+            pivot: p.pivot,
+            recip: p.recip,
+            recip2: p.recip2,
+        };
+
+        self.dispatch(&self.pipeline_exact, bytemuck::bytes_of(&params), size)
+    }
+
+    /// Render the unit tile at the origin with the fixed-point pipeline.
+    pub fn render_exact(&self, m: &Material, size: u32) -> Tile {
+        self.render_tile_exact(m, TileId::new(0, 0), size)
+    }
+
+    /// Upload parameters, run one pipeline over a tile, read it back.
+    fn dispatch(&self, pipeline: &wgpu::ComputePipeline, params: &[u8], size: u32) -> Tile {
         let bytes = (size as u64) * (size as u64) * 4;
         let pbuf = wgpu::util::DeviceExt::create_buffer_init(
             &self.device,
             &wgpu::util::BufferInitDescriptor {
                 label: Some("params"),
-                contents: bytemuck::bytes_of(&params),
+                contents: params,
                 usage: wgpu::BufferUsages::STORAGE,
             },
         );
@@ -227,7 +311,7 @@ impl Gpu {
 
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("synth"),
-            layout: &self.pipeline.get_bind_group_layout(0),
+            layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -250,7 +334,7 @@ impl Gpu {
                 label: Some("synth"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind, &[]);
             let groups = size.div_ceil(8);
             pass.dispatch_workgroups(groups, groups, 1);

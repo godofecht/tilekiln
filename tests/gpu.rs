@@ -25,10 +25,13 @@
 //! smaller, and 5 of those samples sat close enough to a boundary to
 //! round to a different byte.
 //!
-//! Exactness on *every* driver would mean not using floats at all, which
-//! is how `perturbation-kernel` underneath does it: emulated integer
-//! multiplication and an integer reduction, nothing left to reassociate.
-//! Fixed-point synthesis is the route, and it is not taken.
+//! Exactness on *every* driver means not using floats at all, which is
+//! what `Material::render_tile_exact` does: Q4.27 integers throughout,
+//! with the 64-bit multiply and the integer square root spelled out in
+//! `synth_exact.wgsl` because WGSL has no integer wider than 32 bits.
+//! The tests at the bottom of this file assert `to_bits()` equality for
+//! that path, with no tolerance, and it holds on Metal where the
+//! floating-point path manages none of the nine combinations.
 
 #![cfg(feature = "gpu")]
 
@@ -253,5 +256,170 @@ fn odd_tile_sizes_stay_within_the_error_bound() {
     };
     for size in [1u32, 3, 7, 8, 9, 31, 33] {
         compare(&gpu, &m, TileId::new(0, 0), size, &format!("size {size}"));
+    }
+}
+
+// =====================================================================
+// The fixed-point path
+// =====================================================================
+//
+// No bound here, and no tolerance. Every operation on both sides is an
+// integer multiply, add or shift, so the results are equal or the
+// implementation is wrong.
+
+fn compare_exact(gpu: &Gpu, m: &Material, tile: TileId, size: u32, what: &str) {
+    let host = m.render_tile_exact(tile, size);
+    let dev = gpu.render_tile_exact(m, tile, size);
+    assert_eq!(host.data.len(), dev.data.len(), "{what}: length mismatch");
+
+    let mut differing = 0usize;
+    let mut first = None;
+    for (i, (h, d)) in host.data.iter().zip(&dev.data).enumerate() {
+        if h.to_bits() != d.to_bits() {
+            differing += 1;
+            if first.is_none() {
+                first = Some((i, *h, *d));
+            }
+        }
+    }
+    if let Some((i, h, d)) = first {
+        let (x, y) = (i as u32 % size, i as u32 / size);
+        panic!(
+            "{what}: {differing} of {} pixels differ. First at ({x}, {y}): \
+             host {h:.9} ({:08x}) vs device {d:.9} ({:08x})",
+            host.data.len(),
+            h.to_bits(),
+            d.to_bits()
+        );
+    }
+}
+
+#[test]
+fn the_fixed_point_path_is_bit_identical() {
+    let gpu = gpu_or_skip!();
+    let mut checked = 0;
+    for basis in [Basis::Value, Basis::Gradient, Basis::Worley] {
+        for pattern in [Pattern::Fractal, Pattern::Ridged, Pattern::Warped] {
+            let m = Material {
+                basis,
+                pattern,
+                frequency: 5.0,
+                octaves: 4,
+                sharpness: 3,
+                warp: 0.7,
+                contrast: 1.3,
+                seed: 999,
+                ..Default::default()
+            };
+            compare_exact(
+                &gpu,
+                &m,
+                TileId::new(3, -7),
+                64,
+                &format!("{basis:?}/{pattern:?}"),
+            );
+            checked += 1;
+        }
+    }
+    eprintln!("{checked} basis/pattern combinations bit-identical");
+}
+
+#[test]
+fn the_fixed_point_path_is_bit_identical_on_far_tiles() {
+    let gpu = gpu_or_skip!();
+    let m = Material {
+        basis: Basis::Gradient,
+        pattern: Pattern::Ridged,
+        frequency: 6.0,
+        octaves: 5,
+        sharpness: 3,
+        ..Default::default()
+    };
+    // Out to the last index that does not alias, and one past it, since
+    // a wrapped cell has to agree too.
+    for &t in &[0i64, 1 << 10, 1 << 20, m.max_tile(), 1 << 40] {
+        compare_exact(&gpu, &m, TileId::new(t, -t), 48, &format!("tile {t}"));
+    }
+}
+
+#[test]
+fn the_fixed_point_path_is_bit_identical_on_awkward_parameters() {
+    let gpu = gpu_or_skip!();
+    for (i, m) in [
+        // Non-power-of-two frequency, so the origin split is untidy.
+        Material {
+            frequency: 17.31,
+            octaves: 6,
+            ..Default::default()
+        },
+        // Single octave: no doubling at all.
+        Material {
+            frequency: 3.0,
+            octaves: 1,
+            ..Default::default()
+        },
+        // Frequency below one, so the tile sits inside one cell.
+        Material {
+            frequency: 0.25,
+            octaves: 3,
+            ..Default::default()
+        },
+        // Heavy contrast, so the clamp is exercised at both ends.
+        Material {
+            frequency: 4.0,
+            contrast: 12.0,
+            pivot: 0.3,
+            ..Default::default()
+        },
+        // Zero warp on the warped pattern.
+        Material {
+            pattern: Pattern::Warped,
+            warp: 0.0,
+            frequency: 4.0,
+            ..Default::default()
+        },
+        // Sharpness of one: the inner loop runs zero extra times.
+        Material {
+            pattern: Pattern::Ridged,
+            sharpness: 1,
+            frequency: 5.0,
+            ..Default::default()
+        },
+        // Worley at a high frequency, which is where the integer square
+        // root does the most work and where a wrong rejection bound in
+        // the restoring loop would show.
+        Material {
+            basis: Basis::Worley,
+            frequency: 14.0,
+            octaves: 5,
+            ..Default::default()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        compare_exact(
+            &gpu,
+            &m,
+            TileId::new(3, -7),
+            64,
+            &format!("awkward case {i}"),
+        );
+    }
+}
+
+#[test]
+fn the_fixed_point_path_is_bit_identical_at_odd_tile_sizes() {
+    let gpu = gpu_or_skip!();
+    let m = Material {
+        basis: Basis::Worley,
+        frequency: 7.0,
+        octaves: 3,
+        ..Default::default()
+    };
+    // Sizes that do not fill the 8x8 workgroup, where the bounds check
+    // in the shader decides which invocations write.
+    for size in [1u32, 3, 7, 8, 9, 17, 64, 65] {
+        compare_exact(&gpu, &m, TileId::new(1, 1), size, &format!("size {size}"));
     }
 }

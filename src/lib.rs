@@ -23,8 +23,15 @@
 //! Every operation in the synthesis path is `+`, `-` or `*` on `f32`,
 //! plus one correctly-rounded `sqrt`. WGSL specifies those exactly and
 //! leaves `sin`, `exp` and `pow` to the driver, so avoiding the latter
-//! is what holds the GPU path to 9e-6 of the CPU path rather than merely
+//! holds the GPU path to 9e-6 of the CPU path rather than merely
 //! similar. See [`noise`].
+//!
+//! That is as close as floating point gets, because a shader compiler
+//! may fuse a multiply and an add into one `fma` and WGSL cannot forbid
+//! it: llvmpipe matches the host bit for bit, Metal does not. For
+//! agreement that does not depend on the driver there is [`exact`],
+//! which runs the same construction in Q4.27 integers and is
+//! bit-identical everywhere, at 1.6x to 4.2x the cost.
 //!
 //! # Stability
 //!
@@ -55,7 +62,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod exact;
 pub mod features;
+pub mod fixed;
 pub mod hash;
 pub mod material;
 pub mod noise;
