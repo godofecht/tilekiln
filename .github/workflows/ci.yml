@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+      - run: cargo test --release --examples
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # The gpu feature pulls in wgpu, so lint it separately.
+      - run: cargo clippy --all-targets --features gpu -- -D warnings
+      - run: cargo doc --no-deps --features gpu
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  gpu:
+    name: gpu / lavapipe
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # lavapipe is a software Vulkan implementation. It is slow and it
+      # is nobody's GPU, which is exactly what makes it useful here: an
+      # agreement bound that holds on a CPU-based driver and on Metal is
+      # a bound about the code, not about one vendor's rounding.
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          vulkaninfo --summary | head -30
+      # Without this the test would skip on a missing adapter and pass,
+      # which would make the job decorative.
+      - name: Compare host and device
+        run: cargo test --release --features gpu --test gpu -- --nocapture
+        env:
+          TILEKILN_REQUIRE_GPU: "1"
+          WGPU_BACKEND: vulkan
+
+  renders:
+    name: renders are reproducible
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The README images are committed. Regenerating them here checks
+      # that the synthesis path still produces the pictures the README
+      # shows, so a change in the low bits cannot land unnoticed.
+      - run: cargo run --release --example gallery
+      - name: Check the committed images still match
+        run: |
+          if ! git diff --exit-code --stat -- docs/img; then
+            echo
+            echo "The committed renders no longer match what the code produces."
+            echo "If the change is intended, re-run 'cargo run --release --example gallery'"
+            echo "and commit the result."
+            exit 1
+          fi
+          echo "all committed renders reproduced exactly"

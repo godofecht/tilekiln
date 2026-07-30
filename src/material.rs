@@ -12,7 +12,7 @@
 //! topology and exposing scalars is what makes the analysis in
 //! [`crate::analysis`] possible at all.
 
-use crate::noise::{fbm, ridged, warped, Basis};
+use crate::noise::{fbm_at, ridged_at, warped_at, Basis, Lattice};
 
 /// Which fractal construction to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,19 +79,29 @@ impl Material {
     /// [`crate::analysis`] requires of a forward model and what makes
     /// tile addressing meaningful.
     pub fn sample(&self, x: f64, y: f64) -> f32 {
-        // Coordinates stay in f64 through the frequency scaling. f32
-        // has a 24-bit mantissa, so at a tile index around 2^20 its
-        // ulp exceeds the pixel step and adjacent pixels collapse onto
-        // the same lattice cell: measured, 2,207 distinct values out of
-        // 65,536. f64 pushes that past any coordinate a texture plane
-        // will ever use.
+        // Scale in f64, then split. The magnitude ends up in an integer
+        // cell index, so a distant tile is as exact as tile 0; with a
+        // single f32 coordinate, tile 2^20 already collapsed 65,536
+        // pixels onto 2,207 distinct values. See Material::max_tile for
+        // where the integer cell runs out.
         let fx = x * self.frequency as f64;
         let fy = y * self.frequency as f64;
+        self.sample_lattice(Lattice::split(fx), Lattice::split(fy))
+    }
 
+    /// Evaluate at an already-split coordinate.
+    ///
+    /// This is the real entry point. Every arithmetic operation from here
+    /// down is one WGSL specifies exactly, which is what lets the device
+    /// path track the host closely at any tile index. [`Self::sample`]
+    /// is a convenience that splits an `f64` first.
+    pub fn sample_lattice(&self, lx: Lattice, ly: Lattice) -> f32 {
         let raw = match self.pattern {
-            Pattern::Fractal => fbm(self.basis, fx, fy, self.octaves, self.seed),
-            Pattern::Ridged => ridged(self.basis, fx, fy, self.octaves, self.sharpness, self.seed),
-            Pattern::Warped => warped(self.basis, fx, fy, self.octaves, self.warp, self.seed),
+            Pattern::Fractal => fbm_at(self.basis, lx, ly, self.octaves, self.seed),
+            Pattern::Ridged => {
+                ridged_at(self.basis, lx, ly, self.octaves, self.sharpness, self.seed)
+            }
+            Pattern::Warped => warped_at(self.basis, lx, ly, self.octaves, self.warp, self.seed),
         };
 
         // Only the signed patterns need remapping. `ridged` already
@@ -196,21 +206,53 @@ impl Tile {
 }
 
 impl Material {
-    /// Render one tile of an unbounded plane.
+    /// Largest tile index that does not alias onto a nearer one.
+    ///
+    /// The lattice cell is an `i32` and wraps, so the field repeats every
+    /// [`Lattice::PERIOD`] cells. A tile covers `frequency` cells, which
+    /// makes the usable range `PERIOD / (2 * frequency)` in each
+    /// direction, the halving because indices run both ways from zero.
+    ///
+    /// ```
+    /// use tilekiln::Material;
+    /// let m = Material { frequency: 6.0, ..Default::default() };
+    /// assert_eq!(m.max_tile(), 357_913_941);
+    /// ```
+    ///
+    /// Nothing enforces this. Rendering past it is well defined and
+    /// mirrorable on the device; it simply returns a copy of somewhere
+    /// nearer.
+    pub fn max_tile(&self) -> i64 {
+        (Lattice::PERIOD / (2.0 * self.frequency as f64)) as i64
+    }
+
+    /// Render one tile of a large addressable plane.
     ///
     /// Tile `(10⁶, −4)` costs exactly what tile `(0, 0)` costs, and
     /// rendering it does not depend on any other tile having been
     /// rendered. Adjacent tiles agree along their shared edge because
     /// both evaluate the same continuous field at the same coordinates,
     /// so there is no seam to hide.
+    ///
+    /// The plane is large rather than unbounded. Beyond
+    /// [`Self::max_tile`] the field repeats, at full detail and without
+    /// complaint. See [`Lattice`] for why.
     pub fn render_tile(&self, tile: TileId, size: u32) -> Tile {
+        // Split the tile origin once, in f64, then step across the tile
+        // in f32. The magnitude lives in the integer cell, so a distant
+        // tile is as exact as tile 0, and every per-pixel operation is
+        // one the WGSL mirror performs identically.
+        let freq = self.frequency as f64;
+        let ox = Lattice::split(tile.x as f64 * freq);
+        let oy = Lattice::split(tile.y as f64 * freq);
+        let step = self.frequency / size as f32;
+
         let mut data = Vec::with_capacity((size * size) as usize);
-        let inv = 1.0 / size as f64;
         for iy in 0..size {
+            let ly = oy.offset(iy as f32 * step);
             for ix in 0..size {
-                let x = tile.x as f64 + ix as f64 * inv;
-                let y = tile.y as f64 + iy as f64 * inv;
-                data.push(self.sample(x, y));
+                let lx = ox.offset(ix as f32 * step);
+                data.push(self.sample_lattice(lx, ly));
             }
         }
         Tile { size, data }
@@ -224,6 +266,88 @@ impl Material {
 
 #[cfg(test)]
 mod tests {
+    // The original far-tile test checked that a distant tile still had
+    // detail, and passed while tile 2^40 was returning a byte-identical
+    // copy of tile 0. Detail is the wrong thing to measure; distinctness
+    // is. This is that test.
+    #[test]
+    fn tiles_inside_the_usable_range_are_all_different() {
+        let m = Material {
+            basis: crate::Basis::Gradient,
+            pattern: Pattern::Ridged,
+            frequency: 6.0,
+            octaves: 5,
+            sharpness: 3,
+            ..Default::default()
+        };
+        let limit = m.max_tile();
+        let count = |t: i64| -> (Vec<u32>, usize) {
+            let tile = m.render_tile(TileId::new(t, 0), 24);
+            let bits: Vec<u32> = tile.data.iter().map(|v| v.to_bits()).collect();
+            let distinct = bits
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            (bits, distinct)
+        };
+
+        // Tile 0 sets the baseline. An absolute threshold would be a
+        // guess about how much variety this material happens to have;
+        // what matters is that a distant tile does not have *less*.
+        let (base_bits, baseline) = count(0);
+        let mut seen = std::collections::BTreeSet::new();
+        seen.insert(base_bits);
+
+        for &t in &[1i64, 1 << 10, 1 << 20, 1 << 26, limit / 2, limit] {
+            let (bits, distinct) = count(t);
+            assert!(
+                seen.insert(bits),
+                "tile {t} is a bit-for-bit copy of an earlier tile, inside the \
+                 usable range of {limit}"
+            );
+            assert!(
+                distinct * 4 >= baseline * 3,
+                "tile {t} resolves {distinct} distinct values against {baseline} \
+                 at tile 0, so the coordinate has lost precision"
+            );
+        }
+    }
+
+    // The period is a documented property, so pin it. If the cell ever
+    // widens beyond i32 this fails and the docs get corrected with it.
+    #[test]
+    fn the_field_repeats_exactly_at_the_documented_period() {
+        let m = Material {
+            frequency: 6.0,
+            octaves: 4,
+            ..Default::default()
+        };
+        let base = m.render_tile(TileId::new(0, 0), 16);
+
+        // One full period in cells, converted back to tiles: 2^32 / 6 is
+        // not an integer, so use a multiple that is. 2^40 * 6 is exactly
+        // 1536 * 2^32.
+        let aliased = m.render_tile(TileId::new(1 << 40, 0), 16);
+        assert!(
+            base.data
+                .iter()
+                .zip(&aliased.data)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "tile 2^40 should alias exactly onto tile 0 at frequency 6"
+        );
+
+        // And just inside the range it must not.
+        let ok = m.render_tile(TileId::new(m.max_tile(), 0), 16);
+        assert!(
+            base.data
+                .iter()
+                .zip(&ok.data)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the largest in-range tile should not alias onto tile 0"
+        );
+    }
+
     use super::*;
 
     #[test]

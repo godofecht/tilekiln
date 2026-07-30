@@ -22,8 +22,21 @@ Lattice arithmetic runs in `f64`. That is not fussiness: with `f32`
 coordinates, tile 2²⁰ rendered only 2,207 distinct values out of 65,536,
 because `f32`'s ulp at that magnitude exceeds the pixel step and
 adjacent pixels collapse into one lattice cell. The tile still rendered,
-and still rendered fast, which is what made it easy to miss. A test pins
-detail retention out to tile 2⁴⁰.
+and still rendered fast, which is what made it easy to miss.
+
+The lattice cell is an `i32`, because that is the widest integer WGSL
+has, so the plane is large rather than unbounded: the field repeats every
+2³² cells. `Material::max_tile()` returns the last index before that, and
+nothing stops you going past it. Two tests pin the behaviour, one that
+every tile inside the range is distinct and one that the repeat lands
+exactly where the docs say.
+
+That second test exists because the first version of this README was
+wrong. The far-tile strip below used to run out to 2⁴⁰, which at
+frequency 6 is exactly 1536 periods, and the last tile was a
+byte-for-byte copy of the first. It looked completely convincing. The
+original test checked that a distant tile still had *detail*, which it
+did, rather than that it was a different *tile*.
 
 Four tiles in a 2×2 block, rendered independently. Adjacent tiles
 evaluate the same continuous field at the same coordinates, so there is
@@ -31,8 +44,9 @@ no seam to hide:
 
 ![](docs/img/tiling_2x2.png)
 
-The same material at tile 2⁰, 2¹⁰, 2²⁰, 2³⁰ and 2⁴⁰. Different content,
-identical detail, identical cost:
+The same material at tiles 0, 2¹⁰, 2²⁰, 2²⁶ and 357,913,941, the last
+being `max_tile()` at this frequency. Different content, identical
+detail, identical cost:
 
 ![](docs/img/far_tiles.png)
 
@@ -47,9 +61,22 @@ Every operation in the synthesis path is `+`, `-` or `*` on `f32`, plus
 one correctly-rounded `sqrt`. WGSL specifies those exactly and leaves
 `sin`, `exp` and `pow` to the driver, so gradients come from a hashed
 table rather than trigonometry, the interpolant is a quintic polynomial,
-and lacunarity is fixed at 2 so the octave scale factors are exact. That
-discipline is what makes a bit-identical GPU path possible rather than
-merely a similar-looking one.
+and lacunarity is fixed at 2 so the octave scale factors are exact.
+Coordinates travel as an integer cell plus a fractional offset, so a
+tile hundreds of millions out keeps its detail and the octave loop stays
+in step on both sides.
+
+That discipline holds the GPU path to 8.9e-6 of the CPU path, measured
+over 311,040 samples. One level of the 8-bit output is 3.9e-3, about 440
+times larger, so the picture is the same picture.
+
+It is not bit-identical, and the reason is worth stating plainly. A
+shader compiler may fuse a multiply and an add into a single `fma`,
+rounding once where the host rounds twice, and WGSL provides no way to
+forbid it. Nearly every line of the synthesis path is a multiply
+followed by an add. Getting to exact would mean fixed-point integer
+arithmetic, which is how the analysis engine underneath manages a
+bit-exact device path, and that is not built here yet.
 
 ## Stability
 
@@ -170,12 +197,11 @@ count. That is the price of not taking an image-codec dependency in a
 crate whose argument is that it has no hidden state, and it is paid in
 the repository rather than at run time.
 
-Not yet written: the GPU path. The synthesis code is constrained
-throughout to the operations WGSL specifies exactly, which is what makes
-a bit-identical device path reachable, but reachable is not the same as
-reached. Until that shader exists and a test compares the two paths on
-`to_bits()`, treat the bit-identity claim as a design property rather
-than a measured one.
+The GPU path is written and measured, under the `gpu` feature. It agrees
+with the CPU path to 8.9e-6 rather than exactly, for the reason given
+above; `tests/gpu.rs` pins that bound and skips cleanly on machines with
+no adapter. Bit-identity was the aim and would need the synthesis moved
+to fixed-point.
 
 ## License
 

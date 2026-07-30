@@ -23,7 +23,7 @@
 //! Every operation in the synthesis path is `+`, `-` or `*` on `f32`,
 //! plus one correctly-rounded `sqrt`. WGSL specifies those exactly and
 //! leaves `sin`, `exp` and `pow` to the driver, so avoiding the latter
-//! is what lets the GPU path be bit-identical rather than merely
+//! is what holds the GPU path to 9e-6 of the CPU path rather than merely
 //! similar. See [`noise`].
 //!
 //! # Stability
@@ -63,6 +63,9 @@ pub mod png;
 
 #[cfg(feature = "analysis")]
 pub mod analysis;
+
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 pub use features::Feature;
 pub use material::{Material, Pattern, Tile, TileId};

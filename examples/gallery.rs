@@ -131,12 +131,30 @@ fn main() {
     // ---- far tiles keep their detail --------------------------------
     // The bug this guards against: with f32 coordinates, tile 2^20
     // rendered 2,207 distinct values out of 65,536.
+    //
+    // The indices stop at `max_tile()`. An earlier version of this strip
+    // ran out to 2^40, which is past the point where the i32 lattice
+    // cell wraps: the last tile came back byte-identical to the first
+    // while looking perfectly detailed, and the caption underneath it
+    // claimed they differed. Ask for the largest index that means
+    // something instead.
     {
         let m = presets()[1].1;
-        let tiles: Vec<Tile> = [0i64, 1 << 10, 1 << 20, 1 << 30, 1 << 40]
+        let limit = m.max_tile();
+        let indices = [0i64, 1 << 10, 1 << 20, 1 << 26, limit];
+        let tiles: Vec<Tile> = indices
             .iter()
             .map(|&t| m.render_tile(TileId::new(t, 0), 160))
             .collect();
+
+        let distinct = tiles
+            .iter()
+            .map(|t| t.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        println!("\n  far tiles up to {limit}: {distinct}/5 distinct");
+        assert_eq!(distinct, 5, "two of the far tiles are the same tile");
+
         let (w, h, px) = strip(&tiles, 8);
         write("far_tiles.png", &png::grey(w, h, &px));
     }

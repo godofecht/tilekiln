@@ -12,13 +12,115 @@
 //! So: gradients come from a hashed lookup table rather than from
 //! `sin`/`cos`, the interpolant is a quintic polynomial, and the
 //! fractal sum uses power-of-two lacunarity so the scale factors are
-//! exact. `tests/gpu.rs` asserts the two paths agree bit for bit.
+//! exact. `tests/gpu.rs` holds the two paths to 9e-6 of each other; see
+//! `src/gpu/mod.rs` for why that is not zero.
 //!
-//! The one deliberate exception is [`Worley`] distance, which needs a
+//! The one deliberate exception is Worley distance, which needs a
 //! square root. `f32::sqrt` *is* correctly rounded in IEEE-754 and WGSL
 //! inherits that, so it is safe; `inverseSqrt` would not be.
 
 use crate::hash::{hash2, hash3, signed_f32};
+
+/// A coordinate split into an integer lattice cell and a fractional
+/// offset within it.
+///
+/// This is the canonical form the whole synthesis path works in, and the
+/// reason the GPU mirror tracks the host closely at tile indices where a
+/// plain `f32` coordinate has no bits left.
+///
+/// WGSL has no `f64`. Carrying a world coordinate as a single float
+/// therefore forces a choice: use `f64` on the host and give up on
+/// matching the device, or use `f32` and give up on large tile indices —
+/// at tile 2²⁰ an `f32`'s ulp already exceeds the pixel step. Splitting
+/// the coordinate escapes both. The magnitude lives in an integer and
+/// only the sub-cell offset is a float, where `f32` has ample precision.
+///
+/// It also survives octave doubling exactly: doubling a binary fraction
+/// is exact, and the carry into the cell is an integer add. That is what
+/// keeps the fractal loop mirrorable.
+///
+/// # The cell is `i32`, so the field repeats
+///
+/// WGSL's widest integer is 32 bits, so `cell` is `i32` and cell
+/// arithmetic wraps. The field is therefore periodic with period
+/// [`Self::PERIOD`] cells, in each axis.
+///
+/// Wrapping is deliberate rather than incidental. Saturating would fold
+/// every far coordinate onto one cell and destroy the detail there;
+/// wrapping keeps the field fully detailed everywhere and merely repeats
+/// it, and it does so identically on host and device. But it repeats
+/// *silently*: a tile past the period renders at full detail and is a
+/// bit-for-bit copy of a tile inside it. With `frequency = 6.0`, tile
+/// 2⁴⁰ is exactly 1536 periods out and comes back byte-identical to
+/// tile 0.
+///
+/// [`crate::Material::max_tile`] gives the usable range for a given
+/// frequency. Nothing enforces it, because a wrapped coordinate is a
+/// legitimate thing to ask for; it is documented so that it is a choice
+/// rather than a surprise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lattice {
+    /// Integer cell index. Wrapped to `i32` for hashing, which is
+    /// harmless: the hash only needs to decorrelate neighbours.
+    pub cell: i32,
+    /// Offset within the cell, in `[0, 1)`.
+    pub frac: f32,
+}
+
+impl Lattice {
+    /// Cells before the field repeats, in each axis.
+    ///
+    /// The `i32` cell wraps at 2³², so this is that, as an `f64` because
+    /// the coordinates it bounds are computed in `f64`.
+    pub const PERIOD: f64 = 4_294_967_296.0;
+
+    /// Split `v` into cell and fraction.
+    ///
+    /// The integer part is taken modulo [`Self::PERIOD`]. See the type
+    /// docs for what that means for large coordinates.
+    #[inline]
+    pub fn split(v: f64) -> Self {
+        let fl = v.floor();
+        Self {
+            cell: fl as i64 as i32,
+            frac: (v - fl) as f32,
+        }
+    }
+
+    /// Re-normalise after `frac` has moved outside `[0, 1)`.
+    #[inline]
+    pub fn renormalise(self) -> Self {
+        let fl = self.frac.floor();
+        Self {
+            cell: self.cell.wrapping_add(fl as i32),
+            frac: self.frac - fl,
+        }
+    }
+
+    /// Advance by `delta` cells.
+    #[inline]
+    pub fn offset(self, delta: f32) -> Self {
+        Self {
+            cell: self.cell,
+            frac: self.frac + delta,
+        }
+        .renormalise()
+    }
+
+    /// Double the coordinate, as one fractal octave does.
+    ///
+    /// Exact: `frac * 2.0` introduces no rounding in binary floating
+    /// point, and the carry is an integer add.
+    #[inline]
+    pub fn double(self) -> Self {
+        let d = self.frac * 2.0;
+        let fl = d.floor();
+        Self {
+            cell: self.cell.wrapping_mul(2).wrapping_add(fl as i32),
+            frac: d - fl,
+        }
+    }
+}
 
 /// Quintic interpolant, `6t⁵ − 15t⁴ + 10t³`.
 ///
@@ -65,11 +167,13 @@ fn gradient(h: u32) -> (f32, f32) {
 /// Cheaper than gradient noise and blockier. Useful as a warp source
 /// where the character matters less than the cost.
 pub fn value2(x: f64, y: f64, seed: u32) -> f32 {
-    let xi = x.floor();
-    let yi = y.floor();
-    let xf = (x - xi) as f32;
-    let yf = (y - yi) as f32;
-    let (ix, iy) = (xi as i64 as i32, yi as i64 as i32);
+    value2_at(Lattice::split(x), Lattice::split(y), seed)
+}
+
+/// [`value2`] in lattice form. This is the version WGSL mirrors.
+pub fn value2_at(lx: Lattice, ly: Lattice, seed: u32) -> f32 {
+    let (ix, iy) = (lx.cell, ly.cell);
+    let (xf, yf) = (lx.frac, ly.frac);
 
     let u = smootherstep(xf);
     let v = smootherstep(yf);
@@ -88,11 +192,13 @@ pub fn value2(x: f64, y: f64, seed: u32) -> f32 {
 /// gradient per lattice corner, dotted with the offset to the sample
 /// point, blended quintically.
 pub fn gradient2(x: f64, y: f64, seed: u32) -> f32 {
-    let xi = x.floor();
-    let yi = y.floor();
-    let xf = (x - xi) as f32;
-    let yf = (y - yi) as f32;
-    let (ix, iy) = (xi as i64 as i32, yi as i64 as i32);
+    gradient2_at(Lattice::split(x), Lattice::split(y), seed)
+}
+
+/// [`gradient2`] in lattice form. This is the version WGSL mirrors.
+pub fn gradient2_at(lx: Lattice, ly: Lattice, seed: u32) -> f32 {
+    let (ix, iy) = (lx.cell, ly.cell);
+    let (xf, yf) = (lx.frac, ly.frac);
 
     let u = smootherstep(xf);
     let v = smootherstep(yf);
@@ -116,21 +222,28 @@ pub fn gradient2(x: f64, y: f64, seed: u32) -> f32 {
 /// Returns the Euclidean distance, which is unbounded above in
 /// principle and below about 1.5 in practice.
 pub fn worley2(x: f64, y: f64, seed: u32) -> f32 {
-    let xi = x.floor() as i64 as i32;
-    let yi = y.floor() as i64 as i32;
+    worley2_at(Lattice::split(x), Lattice::split(y), seed)
+}
+
+/// [`worley2`] in lattice form. This is the version WGSL mirrors.
+///
+/// Distances are computed relative to the sample cell, so every quantity
+/// stays small and no large coordinate ever enters an `f32`.
+pub fn worley2_at(lx: Lattice, ly: Lattice, seed: u32) -> f32 {
+    let (xi, yi) = (lx.cell, ly.cell);
     let mut best = f32::MAX;
 
     for oy in -1..=1i32 {
         for ox in -1..=1i32 {
-            let cx = xi + ox;
-            let cy = yi + oy;
+            let cx = xi.wrapping_add(ox);
+            let cy = yi.wrapping_add(oy);
             let h = hash2(cx, cy, seed);
             // Two independent offsets from one hash: the low and high
             // halves are decorrelated by the mixing function.
-            let px = cx as f64 + (signed_f32(h) * 0.5 + 0.5) as f64;
-            let py = cy as f64 + (signed_f32(hash3(cx, cy, 1, seed)) * 0.5 + 0.5) as f64;
-            let dx = (px - x) as f32;
-            let dy = (py - y) as f32;
+            // Relative to the sample cell: `ox + jitter - frac`. Every
+            // term is small, so no large magnitude reaches an f32.
+            let dx = ox as f32 + (signed_f32(h) * 0.5 + 0.5) - lx.frac;
+            let dy = oy as f32 + (signed_f32(hash3(cx, cy, 1, seed)) * 0.5 + 0.5) - ly.frac;
             let d2 = dx * dx + dy * dy;
             if d2 < best {
                 best = d2;
@@ -157,11 +270,17 @@ impl Basis {
     #[inline]
     /// Evaluate this primitive at `(x, y)`.
     pub fn sample(self, x: f64, y: f64, seed: u32) -> f32 {
+        self.sample_at(Lattice::split(x), Lattice::split(y), seed)
+    }
+
+    /// Evaluate this primitive in lattice form.
+    #[inline]
+    pub fn sample_at(self, lx: Lattice, ly: Lattice, seed: u32) -> f32 {
         match self {
-            Basis::Value => value2(x, y, seed),
-            Basis::Gradient => gradient2(x, y, seed),
+            Basis::Value => value2_at(lx, ly, seed),
+            Basis::Gradient => gradient2_at(lx, ly, seed),
             // Recentre to roughly [-1, 1] so octaves compose sensibly.
-            Basis::Worley => worley2(x, y, seed) * 2.0 - 1.0,
+            Basis::Worley => worley2_at(lx, ly, seed) * 2.0 - 1.0,
         }
     }
 }
@@ -175,18 +294,23 @@ impl Basis {
 /// configurable lacunarity of, say, 2.1 would reintroduce exactly the
 /// divergence this crate is built to avoid.
 pub fn fbm(basis: Basis, x: f64, y: f64, octaves: u32, seed: u32) -> f32 {
+    fbm_at(basis, Lattice::split(x), Lattice::split(y), octaves, seed)
+}
+
+/// [`fbm`] in lattice form. This is the version WGSL mirrors.
+pub fn fbm_at(basis: Basis, lx: Lattice, ly: Lattice, octaves: u32, seed: u32) -> f32 {
     let mut sum = 0.0f32;
     let mut amp = 1.0f32;
     let mut norm = 0.0f32;
-    let mut fx = x;
-    let mut fy = y;
+    let mut cx = lx;
+    let mut cy = ly;
 
     for o in 0..octaves.max(1) {
-        sum += amp * basis.sample(fx, fy, seed.wrapping_add(o.wrapping_mul(0x9e37_79b1)));
+        sum += amp * basis.sample_at(cx, cy, seed.wrapping_add(o.wrapping_mul(0x9e37_79b1)));
         norm += amp;
         amp *= 0.5;
-        fx *= 2.0;
-        fy *= 2.0;
+        cx = cx.double();
+        cy = cy.double();
     }
     // Dividing by the accumulated amplitude keeps the result in the
     // basis's own range regardless of octave count. `norm` is a sum of
@@ -206,14 +330,33 @@ pub fn fbm(basis: Basis, x: f64, y: f64, octaves: u32, seed: u32) -> f32 {
 /// Returns a value in `[0, 1]`, unlike [`fbm`], which is signed. The
 /// caller must not remap it a second time.
 pub fn ridged(basis: Basis, x: f64, y: f64, octaves: u32, sharpness: u32, seed: u32) -> f32 {
+    ridged_at(
+        basis,
+        Lattice::split(x),
+        Lattice::split(y),
+        octaves,
+        sharpness,
+        seed,
+    )
+}
+
+/// [`ridged`] in lattice form. This is the version WGSL mirrors.
+pub fn ridged_at(
+    basis: Basis,
+    lx: Lattice,
+    ly: Lattice,
+    octaves: u32,
+    sharpness: u32,
+    seed: u32,
+) -> f32 {
     let mut sum = 0.0f32;
     let mut amp = 1.0f32;
     let mut norm = 0.0f32;
-    let mut fx = x;
-    let mut fy = y;
+    let mut cx = lx;
+    let mut cy = ly;
 
     for o in 0..octaves.max(1) {
-        let n = basis.sample(fx, fy, seed.wrapping_add(o.wrapping_mul(0x9e37_79b1)));
+        let n = basis.sample_at(cx, cy, seed.wrapping_add(o.wrapping_mul(0x9e37_79b1)));
         let r = 1.0 - n.abs();
         // Integer exponent by repeated multiplication: `powf` is not
         // exactly specified in WGSL, and the mirror has to match.
@@ -224,8 +367,8 @@ pub fn ridged(basis: Basis, x: f64, y: f64, octaves: u32, sharpness: u32, seed: 
         sum += amp * sharp;
         norm += amp;
         amp *= 0.5;
-        fx *= 2.0;
-        fy *= 2.0;
+        cx = cx.double();
+        cy = cy.double();
     }
     sum / norm
 }
@@ -236,12 +379,43 @@ pub fn ridged(basis: Basis, x: f64, y: f64, octaves: u32, sharpness: u32, seed: 
 /// eroded or marbled. `strength` is in the same units as the input
 /// coordinates.
 pub fn warped(basis: Basis, x: f64, y: f64, octaves: u32, strength: f32, seed: u32) -> f32 {
-    let wx = fbm(Basis::Value, x + 5.2, y + 1.3, 2, seed ^ 0x5f35_6495);
-    let wy = fbm(Basis::Value, x + 1.7, y + 9.2, 2, seed ^ 0x3c6e_f372);
-    fbm(
+    warped_at(
         basis,
-        x + (strength * wx) as f64,
-        y + (strength * wy) as f64,
+        Lattice::split(x),
+        Lattice::split(y),
+        octaves,
+        strength,
+        seed,
+    )
+}
+
+/// [`warped`] in lattice form. This is the version WGSL mirrors.
+pub fn warped_at(
+    basis: Basis,
+    lx: Lattice,
+    ly: Lattice,
+    octaves: u32,
+    strength: f32,
+    seed: u32,
+) -> f32 {
+    let wx = fbm_at(
+        Basis::Value,
+        lx.offset(5.2),
+        ly.offset(1.3),
+        2,
+        seed ^ 0x5f35_6495,
+    );
+    let wy = fbm_at(
+        Basis::Value,
+        lx.offset(1.7),
+        ly.offset(9.2),
+        2,
+        seed ^ 0x3c6e_f372,
+    );
+    fbm_at(
+        basis,
+        lx.offset(strength * wx),
+        ly.offset(strength * wy),
         octaves,
         seed,
     )
