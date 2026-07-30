@@ -66,17 +66,28 @@ Coordinates travel as an integer cell plus a fractional offset, so a
 tile hundreds of millions out keeps its detail and the octave loop stays
 in step on both sides.
 
-That discipline holds the GPU path to 8.9e-6 of the CPU path, measured
-over 311,040 samples. One level of the 8-bit output is 3.9e-3, about 440
-times larger, so the picture is the same picture.
+Whether that discipline gets you bit-identical output turns out to depend
+on the driver, which was not the expected answer. A shader compiler may
+fuse a multiply and an add into a single `fma`, rounding once where the
+host rounds twice, and WGSL provides no way to forbid it. Nearly every
+line of the synthesis path is a multiply followed by an add.
 
-It is not bit-identical, and the reason is worth stating plainly. A
-shader compiler may fuse a multiply and an add into a single `fma`,
-rounding once where the host rounds twice, and WGSL provides no way to
-forbid it. Nearly every line of the synthesis path is a multiply
-followed by an add. Getting to exact would mean fixed-point integer
-arithmetic, which is how the analysis engine underneath manages a
-bit-exact device path, and that is not built here yet.
+Same shader, nine basis and pattern combinations, one 64×64 tile:
+
+| driver | bit-identical | worst error |
+|---|---|---|
+| llvmpipe (software Vulkan) | 8 of 9 | 1.2e-7 |
+| Apple M4 Max (Metal) | 0 of 9 | 7.2e-7 |
+
+llvmpipe matches the host almost everywhere, so the arithmetic is
+expressed exactly. Metal fuses, so it does not. WGSL permits both.
+
+The portable promise is therefore a bound. Across 311,040 samples the
+worst disagreement was 8.9e-6, against an 8-bit output level of 3.9e-3,
+about 440 times larger. The picture is the same picture. Guaranteeing
+exactness on every driver would mean dropping floats for fixed point,
+which is how the analysis engine underneath manages a bit-exact device
+path, and that is not built here.
 
 ## Stability
 
@@ -197,11 +208,11 @@ count. That is the price of not taking an image-codec dependency in a
 crate whose argument is that it has no hidden state, and it is paid in
 the repository rather than at run time.
 
-The GPU path is written and measured, under the `gpu` feature. It agrees
-with the CPU path to 8.9e-6 rather than exactly, for the reason given
-above; `tests/gpu.rs` pins that bound and skips cleanly on machines with
-no adapter. Bit-identity was the aim and would need the synthesis moved
-to fixed-point.
+The GPU path is written and measured, under the `gpu` feature. It is
+bit-identical on drivers that do not fuse and within 8.9e-6 on ones that
+do, for the reason given above. `tests/gpu.rs` pins the bound, reports
+which combinations came out exact, and skips cleanly with no adapter; CI
+runs it on llvmpipe so both rows of that table stay honest.
 
 ## License
 

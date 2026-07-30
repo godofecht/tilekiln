@@ -5,10 +5,10 @@
 // correspondence is the point: `tests/gpu.rs` holds the two paths to
 // 9e-6 of each other, some 440x below one level of the 8-bit output.
 //
-// Exact agreement was the original aim and is not attainable through
-// WGSL, because a driver may fuse a multiply and an add into an `fma`
-// and nothing here can stop it. See `src/gpu/mod.rs` for the
-// measurement and for what exactness would actually require.
+// On llvmpipe it is exact for 8 of 9 basis/pattern combinations, so the
+// arithmetic below really is expressed exactly. Apple's Metal compiler
+// fuses a multiply and an add into an `fma` and nothing here can stop it,
+// which is where the remaining error comes from. See `src/gpu/mod.rs`.
 //
 // Three rules keep the error at that scale rather than a visible one,
 // and breaking any of them widens it silently.

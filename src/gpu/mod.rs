@@ -1,4 +1,5 @@
-//! Device synthesis via `wgpu`, matching the CPU path to 9e-6.
+//! Device synthesis via `wgpu`, matching the CPU path to 9e-6, and
+//! exactly on drivers that do not fuse.
 //!
 //! Texture synthesis is embarrassingly parallel per pixel, so a device
 //! is the obvious place to run it. The question worth asking is how
@@ -23,32 +24,47 @@
 //! is then exact on both sides, because doubling a binary fraction
 //! introduces no rounding and the carry is an integer add.
 //!
-//! # What it does not buy
+//! # Bit-identity turns out to belong to the driver
 //!
-//! The original goal was bit-identity, and that goal is not met. A
-//! shader compiler may fuse a multiply and an add into a single `fma`,
-//! rounding once where the host rounds twice, and WGSL has no way to
-//! forbid it. Almost every line here is a multiply followed by an add,
-//! so the difference arises in several places at once; adding an
-//! explicit `mul_add` on the host brings one of them into line and
-//! leaves the others, which is how the cause was pinned down.
+//! The goal was bit-identity. Whether it is reached depends on which
+//! driver compiles the shader, which was not the answer this module was
+//! built expecting.
 //!
-//! Measured over 311,040 samples across every basis and pattern, five
-//! parameter sets and tile indices past the lattice wrap point, the
-//! worst disagreement was
-//! 8.9e-6 in absolute terms. One level of the 8-bit output is 3.9e-3,
-//! roughly 440 times larger, so the rendered image is the same image: 5
-//! of those samples sat close enough to a quantisation boundary to land
-//! on a different byte.
+//! A shader compiler is free to fuse a multiply and an add into a single
+//! `fma`, rounding once where the host rounds twice, and WGSL provides no
+//! way to forbid it. Almost every line of the synthesis path is a
+//! multiply followed by an add: the quintic interpolant, the gradient dot
+//! product, the octave accumulation, the contrast remap.
 //!
-//! `tests/gpu.rs` pins that bound and skips cleanly when no adapter is
-//! present.
+//! Two drivers, same shader, 64×64 tile, nine basis/pattern combinations:
 //!
-//! Exactness is still reachable, but not this way. It needs integer
-//! arithmetic, which is how `perturbation-kernel` gets a bit-exact
-//! device path: emulated integer multiplication and an integer
-//! reduction, with no float rounding to disagree about. Fixed-point
-//! synthesis is the route here too, and it is not yet built.
+//! | driver | exact | worst error |
+//! |---|---|---|
+//! | llvmpipe (software Vulkan, LLVM 20.1.2) | 8 of 9 | 1.2e-7 |
+//! | Apple M4 Max (Metal) | 0 of 9 | 7.2e-7 |
+//!
+//! llvmpipe reproduces the host bit for bit almost everywhere, so the
+//! arithmetic really is expressed exactly and the discipline above really
+//! does its job. Metal fuses, so it does not. Neither is wrong; WGSL
+//! permits both.
+//!
+//! What can be promised portably is therefore a bound rather than
+//! equality. Over 311,040 samples spanning every basis and pattern, five
+//! parameter sets and tile indices past the lattice wrap point, the worst
+//! disagreement on Metal was 8.9e-6. One level of the 8-bit output is
+//! 3.9e-3, roughly 440 times larger, so the rendered image is the same
+//! image: 5 of those samples sat close enough to a quantisation boundary
+//! to land on a different byte.
+//!
+//! `tests/gpu.rs` pins that bound, reports which combinations came out
+//! exact, and skips cleanly when no adapter is present. CI runs it on
+//! llvmpipe, so both columns of that table stay honest.
+//!
+//! Guaranteed exactness on every driver would mean not using floats at
+//! all. That is how `perturbation-kernel` underneath gets a bit-exact
+//! device path: emulated integer multiplication and an integer reduction,
+//! with no float rounding left for a compiler to reassociate. Fixed-point
+//! synthesis is the route here too, and it is not built.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -149,9 +165,10 @@ impl Gpu {
 
     /// Render one tile on the device.
     ///
-    /// Agrees with [`Material::render_tile`] to within 9e-6, which is
-    /// far below one level of the 8-bit output. See the module docs for
-    /// why it is not exact.
+    /// Returns exactly what [`Material::render_tile`] returns on drivers
+    /// that do not fuse a multiply and an add, and within 9e-6 of it on
+    /// ones that do. Either way the gap is far below one level of the
+    /// 8-bit output. See the module docs.
     pub fn render_tile(&self, m: &Material, tile: TileId, size: u32) -> Tile {
         // The host splits the tile origin, exactly as the CPU renderer
         // does, so the device never sees a large coordinate.

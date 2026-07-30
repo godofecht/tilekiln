@@ -1,39 +1,34 @@
 //! How closely does the device match the host?
 //!
-//! The synthesis path was built for *bit*-identity: hashed gradients
+//! The synthesis path was built for bit-identity: hashed gradients
 //! instead of trigonometry, a quintic polynomial interpolant, repeated
 //! multiplication instead of `pow`, lacunarity pinned at 2, coordinates
-//! split into an integer cell and a fractional offset. All of that was
-//! necessary. None of it is sufficient.
+//! split into an integer cell and a fractional offset.
 //!
-//! The obstacle is floating-point contraction. A shader compiler is free
-//! to fuse `a + t * (b - a)` into a single `fma`, which rounds once
-//! where the host rounds twice, and WGSL offers no way to forbid it.
-//! Every stage here is a multiply followed by an add -- the interpolant,
-//! the gradient dot product, the octave accumulation, the contrast remap
-//! -- so the difference appears in several places at once. Adding an
-//! explicit `mul_add` on the host moves one of them into agreement and
-//! leaves the rest, which is how the cause was identified.
+//! Whether it gets there depends on the driver. A shader compiler may
+//! fuse a multiply and an add into one `fma`, rounding once where the
+//! host rounds twice, and WGSL cannot forbid it. On llvmpipe, 8 of the 9
+//! basis/pattern combinations below come back bit-identical, so the
+//! arithmetic is expressed exactly. On Apple's Metal compiler none of
+//! them do, because nearly every line of the path is a multiply followed
+//! by an add.
 //!
-//! So these tests measure the gap instead of asserting equality. Units
-//! in the last place turn out to be the wrong metric: ulp shrink towards
-//! zero, so a fixed absolute error near a dark pixel counts as tens of
-//! thousands of them. Measured over 311,040 samples spanning every basis
-//! and pattern, five parameter sets and tile indices past the point
-//! where the lattice cell wraps, the worst
-//! ulp gap was 122,880 and the worst *absolute* error was 8.9e-6.
+//! So these tests pin a bound and report which combinations were exact,
+//! rather than asserting equality and failing on half the machines that
+//! run them.
 //!
-//! Absolute error is what matters for a texture, because the output is
-//! quantised to eight bits. One level is 3.9e-3, some 440 times larger
-//! than the worst disagreement, so the rendered image is the same image:
-//! 5 pixels in 311,040 crossed a quantisation boundary and differed by
-//! one least-significant byte.
+//! Units in the last place are the wrong metric for the bound: ulp shrink
+//! towards zero, so a fixed absolute error near a dark pixel counts as
+//! tens of thousands of them. Absolute error is what matters, because the
+//! output is quantised to eight bits. One level is 3.9e-3; the worst
+//! disagreement measured over 311,040 samples was 8.9e-6, some 440 times
+//! smaller, and 5 of those samples sat close enough to a boundary to
+//! round to a different byte.
 //!
-//! Exactness would need integer arithmetic rather than careful `f32`,
-//! which is the same conclusion `perturbation-kernel` reached: its
-//! bit-exact device path is built on emulated integer multiplication and
-//! an integer reduction, not on floating-point discipline. Fixed-point
-//! synthesis is the route, and it is not yet taken.
+//! Exactness on *every* driver would mean not using floats at all, which
+//! is how `perturbation-kernel` underneath does it: emulated integer
+//! multiplication and an integer reduction, nothing left to reassociate.
+//! Fixed-point synthesis is the route, and it is not taken.
 
 #![cfg(feature = "gpu")]
 
@@ -114,6 +109,7 @@ fn every_pattern_and_basis_stays_within_the_error_bound() {
     eprintln!("device: {}", gpu.name);
 
     let mut checked = 0;
+    let mut exact = 0;
     for basis in [Basis::Value, Basis::Gradient, Basis::Worley] {
         for pattern in [Pattern::Fractal, Pattern::Ridged, Pattern::Warped] {
             let m = Material {
@@ -134,15 +130,22 @@ fn every_pattern_and_basis_stays_within_the_error_bound() {
                 64,
                 &format!("{basis:?}/{pattern:?}"),
             );
-            eprintln!(
-                "  {basis:?}/{pattern:?}: worst {worst:.2e} ({:.0}x below one 8-bit level), \
-                 {bytes} bytes differ",
-                QUANT_STEP / worst.max(f32::MIN_POSITIVE)
-            );
+            let how_close = if worst == 0.0 {
+                "exact".to_string()
+            } else {
+                format!(
+                    "{worst:.2e}, {:.0}x below one 8-bit level",
+                    QUANT_STEP / worst
+                )
+            };
+            eprintln!("  {basis:?}/{pattern:?}: {how_close}, {bytes} bytes differ");
+            if worst == 0.0 {
+                exact += 1;
+            }
             checked += 1;
         }
     }
-    eprintln!("{checked} combinations within {MAX_ABS_ERROR:.0e}");
+    eprintln!("{exact} of {checked} combinations exact, all within {MAX_ABS_ERROR:.0e}");
 }
 
 #[test]
